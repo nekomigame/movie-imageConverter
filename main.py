@@ -6,6 +6,8 @@ import sys
 import subprocess
 from PIL import Image
 import install_ffmpeg
+import threading
+from queue import Queue, Empty
 
 
 class ConverterApp(tk.Tk):
@@ -23,6 +25,7 @@ class ConverterApp(tk.Tk):
         self.selected_encoder = tk.StringVar()
         self.available_encoders = []
         self.ffmpeg_available = False
+        self.task_queue = Queue()
 
         # --- フォーマット定義 ---
         self.image_formats = [
@@ -212,24 +215,58 @@ class ConverterApp(tk.Tk):
             return
 
         self.execute_button["state"] = "disabled"
-        self.status_text.set("処理を実行中...")
-        self.update_idletasks()
+        self.status_text.set("処理を開始します...")
+        
+        while not self.task_queue.empty():
+            try:
+                self.task_queue.get_nowait()
+            except Empty:
+                break
 
+        thread = threading.Thread(target=self._execute_task_threaded)
+        thread.daemon = True
+        thread.start()
+        self.process_queue()
+
+    def _execute_task_threaded(self):
+        """This runs in a separate thread."""
         try:
             if self.mode.get() == "convert":
                 self.convert_file()
             else:
                 self.compress_file()
         except Exception as e:
-            self.status_text.set(f"エラー: {e}")
-            messagebox.showerror("エラー", f"処理中にエラーが発生しました:\n{e}")
-        finally:
-            # 正常終了時のみ入力ファイルパスをクリア
-            if "完了" in self.status_text.get():
+            self.task_queue.put(("error", e))
+
+    def process_queue(self):
+        """Process messages from the worker thread."""
+        try:
+            message = self.task_queue.get_nowait()
+            msg_type, msg_payload = message
+
+            if msg_type == "status":
+                self.status_text.set(msg_payload)
+            elif msg_type == "error":
+                self.status_text.set(f"エラー: {msg_payload}")
+                messagebox.showerror("エラー", f"処理中にエラーが発生しました:\n{msg_payload}")
+                self.execute_button["state"] = "normal"
+                return # Stop polling
+            elif msg_type == "success":
+                mode, msg = msg_payload
+                self.status_text.set(f"{mode.capitalize()}完了")
+                messagebox.showinfo("成功", msg)
                 self.input_file_path.set("")
                 self.status_text.set("処理するファイルを選択してください。")
-            self.execute_button["state"] = "normal" if self.input_file_path.get(
-            ) else "disabled"
+                self.execute_button["state"] = "normal"
+                return # Stop polling
+            elif msg_type == "warning":
+                 messagebox.showwarning("警告", msg_payload)
+            
+        except Empty:
+            pass # No message yet
+        
+        if self.execute_button["state"] == "disabled":
+            self.after(100, self.process_queue)
 
     def convert_file(self):
         input_path = self.input_file_path.get()
@@ -242,45 +279,44 @@ class ConverterApp(tk.Tk):
         output_path = os.path.join(
             directory, f"{name_without_ext}.{target_ext}")
 
-        self.status_text.set(f"変換中... -> {os.path.basename(output_path)}")
-        self.update_idletasks()
+        self.task_queue.put(("status", f"変換中... -> {os.path.basename(output_path)}"))
 
         self._run_process(input_path, output_path)
-        self.status_text.set(f"変換完了: {os.path.basename(output_path)}")
-        messagebox.showinfo("成功", f"ファイルの変換が完了しました。\n保存先: {output_path}")
+        
+        success_msg = f"ファイルの変換が完了しました。\n保存先: {output_path}"
+        self.task_queue.put(("success", ("convert", success_msg)))
 
     def compress_file(self):
-        input_path = self.input_file_path.get()
         try:
             target_size = float(self.target_size_mb.get())
             if target_size <= 0:
-                messagebox.showerror("エラー", "目標ファイルサイズは0より大きい値を入力してください。")
-                return
+                raise ValueError("目標ファイルサイズは0より大きい値を入力してください。")
         except ValueError:
-            messagebox.showerror("エラー", "目標ファイルサイズには数値を入力してください。")
-            return
+            raise ValueError("目標ファイルサイズには数値を入力してください。")
 
-        # Get selected encoder codec
         selected_encoder_name = self.selected_encoder.get()
-        encoder_codec = "libx264"  # default
+        encoder_codec = "libx264"
         for name, codec in self.available_encoders:
             if name == selected_encoder_name:
                 encoder_codec = codec
                 break
-
+        
+        input_path = self.input_file_path.get()
         directory, filename = os.path.split(input_path)
         name, ext = os.path.splitext(filename)
         output_path = os.path.join(directory, f"{name}_compressed{ext}")
 
-        self.status_text.set(f"圧縮中... -> {os.path.basename(output_path)}")
-        self.update_idletasks()
+        self.task_queue.put(("status", f"圧縮中... -> {os.path.basename(output_path)}"))
 
         self._run_process(input_path, output_path, target_size_mb=target_size, encoder=encoder_codec)
 
         if os.path.exists(output_path):
             final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-            self.status_text.set(f"圧縮完了: {os.path.basename(output_path)} ({final_size_mb:.2f}MB)")
-            messagebox.showinfo("成功", f"ファイルの圧縮が完了しました。\n保存先: {output_path}")
+            self.task_queue.put(("status", f"圧縮完了: {os.path.basename(output_path)} ({final_size_mb:.2f}MB)"))
+            success_msg = f"ファイルの圧縮が完了しました。\n保存先: {output_path}"
+            self.task_queue.put(("success", ("compress", success_msg)))
+        else:
+            raise RuntimeError("圧縮ファイルの生成に失敗しました。詳細は警告メッセージを確認してください。")
 
     def _run_process(self, input_path, output_path, quality=None, target_size_mb=None, encoder=None):
         input_ext = input_path.split('.')[-1].lower()
@@ -295,47 +331,38 @@ class ConverterApp(tk.Tk):
 
     def _process_image(self, input_path, output_path, quality, target_size_mb=None):
         with Image.open(input_path) as img:
-            # --- New logic for target size compression ---
             if target_size_mb is not None:
                 target_bytes = target_size_mb * 1024 * 1024
                 output_ext = output_path.split('.')[-1].lower()
 
-                # Ensure output format supports quality setting for this purpose
                 if output_ext not in ('jpg', 'jpeg', 'webp'):
-                    messagebox.showwarning("警告", f"目標サイズ指定圧縮はJPG/JPEG/WEBP形式でのみ有効です。他の形式ではファイルサイズが変わりません。\nファイルをそのままコピーします。")
-                    img.save(output_path) # Just copy it
+                    self.task_queue.put(("warning", f"目標サイズ指定圧縮はJPG/JPEG/WEBP形式でのみ有効です。他の形式ではファイルサイズが変わりません。\nファイルをそのままコピーします。"))
+                    img.save(output_path)
                     return
 
-                # Convert RGBA to RGB for JPEG
                 if output_ext in ('jpg', 'jpeg') and img.mode == 'RGBA':
                     img = img.convert('RGB')
 
-                # Iteratively find the best quality by stepping down
-                for q in range(95, 5, -5): # Start from 95 down to 10
+                for q in range(95, 5, -5):
                     try:
                         from io import BytesIO
                         buffer = BytesIO()
-                        # Pillow format name for jpg is JPEG
                         img_format = 'JPEG' if output_ext in ('jpg', 'jpeg') else output_ext.upper()
                         img.save(buffer, format=img_format, quality=q)
                         if buffer.tell() <= target_bytes:
-                            # Found a quality that works, save and exit
                             with open(output_path, 'wb') as f:
                                 f.write(buffer.getvalue())
                             return
                     except Exception as e:
-                        messagebox.showwarning("警告", f".{output_ext} 形式は品質指定による圧縮に失敗しました。\n{e}")
-                        img.save(output_path) # Save without quality and return
+                        self.task_queue.put(("warning", f".{output_ext} 形式は品質指定による圧縮に失敗しました。\n{e}"))
+                        img.save(output_path)
                         return
                 
-                # If loop finishes, it means even at the lowest quality, the size is too large.
-                # Save with the lowest quality we tried.
                 img.save(output_path, quality=5)
                 final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                messagebox.showwarning("警告", f"目標サイズ({target_size_mb:.2f}MB)に到達できませんでした。可能な限り低い品質で圧縮しました (結果: {final_size_mb:.2f}MB)。")
+                self.task_queue.put(("warning", f"目標サイズ({target_size_mb:.2f}MB)に到達できませんでした。可能な限り低い品質で圧縮しました (結果: {final_size_mb:.2f}MB)。"))
                 return
 
-            # --- Original logic for conversion/quality-preset compression ---
             options = {}
             output_ext = output_path.split('.')[-1].lower()
             if quality:
@@ -364,9 +391,8 @@ class ConverterApp(tk.Tk):
             raise RuntimeError(f"動画の長さの取得に失敗しました: {e}\nffprobeがPATHに設定されているか確認してください。")
 
     def _process_video(self, input_path, output_path, quality, target_size_mb=None, encoder=None):
-        # --- New logic for target size compression ---
         if target_size_mb is not None:
-            encoder = encoder or "libx264" # Default to libx264 if None
+            encoder = encoder or "libx264"
             try:
                 duration = self._get_video_duration(input_path)
                 if duration <= 0:
@@ -374,13 +400,12 @@ class ConverterApp(tk.Tk):
             except Exception as e:
                  raise RuntimeError(f"動画情報の取得に失敗しました:\n{e}")
 
-            # Calculate target bitrate in kbits/s
             audio_bitrate_kbps = 128
             target_total_bitrate_kbps = (target_size_mb * 1024 * 8) / duration
             target_video_bitrate_kbps = target_total_bitrate_kbps - audio_bitrate_kbps
 
             if target_video_bitrate_kbps <= 100:
-                messagebox.showwarning("警告", "目標ファイルサイズが小さすぎるため、品質が著しく低下する可能性があります。")
+                self.task_queue.put(("warning", "目標ファイルサイズが小さすぎるため、品質が著しく低下する可能性があります。"))
                 target_video_bitrate_kbps = 100
 
             target_video_bitrate_str = f"{int(target_video_bitrate_kbps)}k"
@@ -390,8 +415,7 @@ class ConverterApp(tk.Tk):
             with tempfile.TemporaryDirectory() as tempdir:
                 log_prefix = os.path.join(tempdir, "ffmpeg2pass")
 
-                self.status_text.set(f"圧縮中... (1/2 パス, {encoder})")
-                self.update_idletasks()
+                self.task_queue.put(("status", f"圧縮中... (1/2 パス, {encoder})"))
                 
                 pass1_cmd = [
                     "ffmpeg", "-y", "-i", input_path,
@@ -405,8 +429,7 @@ class ConverterApp(tk.Tk):
                 except subprocess.CalledProcessError as e:
                     raise RuntimeError(f"FFmpegエラー (パス1, {encoder}):\n{e.stderr}")
 
-                self.status_text.set(f"圧縮中... (2/2 パス, {encoder})")
-                self.update_idletasks()
+                self.task_queue.put(("status", f"圧縮中... (2/2 パス, {encoder})"))
 
                 pass2_cmd = [
                     "ffmpeg", "-i", input_path,
@@ -424,10 +447,9 @@ class ConverterApp(tk.Tk):
             if os.path.exists(output_path):
                 final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
                 if final_size_mb > target_size_mb * 1.1:
-                     messagebox.showwarning("警告", f"目標サイズ({target_size_mb:.2f}MB)を少し超えました (結果: {final_size_mb:.2f}MB)。")
+                     self.task_queue.put(("warning", f"目標サイズ({target_size_mb:.2f}MB)を少し超えました (結果: {final_size_mb:.2f}MB)。"))
             return
 
-        # --- Original logic for conversion/quality-preset compression ---
         command = ["ffmpeg", "-i", input_path, "-y"]
         if quality:
             crf_map = {"High": 20, "Medium": 25, "Low": 30}
