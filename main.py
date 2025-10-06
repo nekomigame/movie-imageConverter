@@ -19,7 +19,7 @@ class ConverterApp(tk.Tk):
         self.status_text = tk.StringVar(value="処理するファイルを選択してください。")
         self.mode = tk.StringVar(value="convert")
         self.selected_format = tk.StringVar()
-        self.compression_quality = tk.StringVar(value="Medium")
+        self.target_size_mb = tk.StringVar(value="10")
         self.ffmpeg_available = False
 
         # --- フォーマット定義 ---
@@ -100,11 +100,11 @@ class ConverterApp(tk.Tk):
         # 圧縮オプション
         self.compress_frame = ttk.LabelFrame(
             self.options_container, text="3. 圧縮オプション", padding=(10, 5))
-        quality_label = ttk.Label(self.compress_frame, text="品質:")
-        quality_label.pack(side=tk.LEFT, padx=5)
-        self.quality_menu = ttk.Combobox(
-            self.compress_frame, textvariable=self.compression_quality, state="readonly", values=["High", "Medium", "Low"])
-        self.quality_menu.pack(side=tk.LEFT, padx=5)
+        size_label = ttk.Label(self.compress_frame, text="目標ファイルサイズ(MB):")
+        size_label.pack(side=tk.LEFT, padx=5)
+        self.size_entry = ttk.Entry(
+            self.compress_frame, textvariable=self.target_size_mb, width=10)
+        self.size_entry.pack(side=tk.LEFT, padx=5)
 
         # --- 実行フレーム ---
         execute_frame = tk.Frame(self)
@@ -211,7 +211,14 @@ class ConverterApp(tk.Tk):
 
     def compress_file(self):
         input_path = self.input_file_path.get()
-        quality = self.compression_quality.get()
+        try:
+            target_size = float(self.target_size_mb.get())
+            if target_size <= 0:
+                messagebox.showerror("エラー", "目標ファイルサイズは0より大きい値を入力してください。")
+                return
+        except ValueError:
+            messagebox.showerror("エラー", "目標ファイルサイズには数値を入力してください。")
+            return
 
         directory, filename = os.path.split(input_path)
         name, ext = os.path.splitext(filename)
@@ -220,26 +227,69 @@ class ConverterApp(tk.Tk):
         self.status_text.set(f"圧縮中... -> {os.path.basename(output_path)}")
         self.update_idletasks()
 
-        self._run_process(input_path, output_path, quality)
-        self.status_text.set(f"圧縮完了: {os.path.basename(output_path)}")
-        messagebox.showinfo("成功", f"ファイルの圧縮が完了しました。\n保存先: {output_path}")
+        self._run_process(input_path, output_path, target_size_mb=target_size)
 
-    def _run_process(self, input_path, output_path, quality=None):
+        if os.path.exists(output_path):
+            final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            self.status_text.set(f"圧縮完了: {os.path.basename(output_path)} ({final_size_mb:.2f}MB)")
+            messagebox.showinfo("成功", f"ファイルの圧縮が完了しました。\n保存先: {output_path}")
+
+    def _run_process(self, input_path, output_path, quality=None, target_size_mb=None):
         input_ext = input_path.split('.')[-1].lower()
         if input_ext in self.image_formats:
-            self._process_image(input_path, output_path, quality)
+            self._process_image(input_path, output_path, quality, target_size_mb=target_size_mb)
         elif input_ext in self.video_formats:
             if not self.ffmpeg_available:
                 raise RuntimeError("FFmpegが利用できないため、動画処理を実行できません。")
-            self._process_video(input_path, output_path, quality)
+            self._process_video(input_path, output_path, quality, target_size_mb=target_size_mb)
         else:
             raise ValueError("対応していないファイル形式です。")
 
-    def _process_image(self, input_path, output_path, quality):
+    def _process_image(self, input_path, output_path, quality, target_size_mb=None):
         with Image.open(input_path) as img:
+            # --- New logic for target size compression ---
+            if target_size_mb is not None:
+                target_bytes = target_size_mb * 1024 * 1024
+                output_ext = output_path.split('.')[-1].lower()
+
+                # Ensure output format supports quality setting for this purpose
+                if output_ext not in ('jpg', 'jpeg', 'webp'):
+                    messagebox.showwarning("警告", f"目標サイズ指定圧縮はJPG/JPEG/WEBP形式でのみ有効です。他の形式ではファイルサイズが変わりません。\nファイルをそのままコピーします。")
+                    img.save(output_path) # Just copy it
+                    return
+
+                # Convert RGBA to RGB for JPEG
+                if output_ext in ('jpg', 'jpeg') and img.mode == 'RGBA':
+                    img = img.convert('RGB')
+
+                # Iteratively find the best quality by stepping down
+                for q in range(95, 5, -5): # Start from 95 down to 10
+                    try:
+                        from io import BytesIO
+                        buffer = BytesIO()
+                        # Pillow format name for jpg is JPEG
+                        img_format = 'JPEG' if output_ext in ('jpg', 'jpeg') else output_ext.upper()
+                        img.save(buffer, format=img_format, quality=q)
+                        if buffer.tell() <= target_bytes:
+                            # Found a quality that works, save and exit
+                            with open(output_path, 'wb') as f:
+                                f.write(buffer.getvalue())
+                            return
+                    except Exception as e:
+                        messagebox.showwarning("警告", f".{output_ext} 形式は品質指定による圧縮に失敗しました。\n{e}")
+                        img.save(output_path) # Save without quality and return
+                        return
+                
+                # If loop finishes, it means even at the lowest quality, the size is too large.
+                # Save with the lowest quality we tried.
+                img.save(output_path, quality=5)
+                final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                messagebox.showwarning("警告", f"目標サイズ({target_size_mb:.2f}MB)に到達できませんでした。可能な限り低い品質で圧縮しました (結果: {final_size_mb:.2f}MB)。")
+                return
+
+            # --- Original logic for conversion/quality-preset compression ---
             options = {}
             output_ext = output_path.split('.')[-1].lower()
-
             if quality:
                 quality_map = {"High": 90, "Medium": 75, "Low": 50}
                 options['quality'] = quality_map.get(quality, 75)
@@ -249,7 +299,88 @@ class ConverterApp(tk.Tk):
 
             img.save(output_path, **options)
 
-    def _process_video(self, input_path, output_path, quality):
+    def _get_video_duration(self, input_path):
+        """Get video duration in seconds using ffprobe."""
+        command = [
+            "ffprobe", "-v", "error", "-show_entries",
+            "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+            input_path
+        ]
+        try:
+            result = subprocess.run(
+                command, check=True, capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            return float(result.stdout.strip())
+        except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
+            raise RuntimeError(f"動画の長さの取得に失敗しました: {e}\nffprobeがPATHに設定されているか確認してください。")
+
+    def _process_video(self, input_path, output_path, quality, target_size_mb=None):
+        # --- New logic for target size compression ---
+        if target_size_mb is not None:
+            try:
+                duration = self._get_video_duration(input_path)
+                if duration <= 0:
+                    raise RuntimeError("動画の長さが0秒か、取得できませんでした。")
+            except Exception as e:
+                 raise RuntimeError(f"動画情報の取得に失敗しました:\n{e}")
+
+            # Calculate target bitrate in kbits/s
+            # We need to account for audio bitrate. Assume 128kbps for audio.
+            audio_bitrate_kbps = 128
+            target_total_bitrate_kbps = (target_size_mb * 1024 * 8) / duration
+            target_video_bitrate_kbps = target_total_bitrate_kbps - audio_bitrate_kbps
+
+            if target_video_bitrate_kbps <= 100: # Set a minimum video bitrate
+                messagebox.showwarning("警告", "目標ファイルサイズが小さすぎるため、品質が著しく低下する可能性があります。")
+                target_video_bitrate_kbps = 100 # Enforce minimum to avoid errors
+
+            target_video_bitrate_str = f"{int(target_video_bitrate_kbps)}k"
+            audio_bitrate_str = f"{audio_bitrate_kbps}k"
+            
+            # Use a temporary directory for log files to keep the user's directory clean
+            import tempfile
+            with tempfile.TemporaryDirectory() as tempdir:
+                log_prefix = os.path.join(tempdir, "ffmpeg2pass")
+
+                # Two-pass encoding
+                self.status_text.set("圧縮中... (1/2 パス)")
+                self.update_idletasks()
+                
+                pass1_cmd = [
+                    "ffmpeg", "-y", "-i", input_path,
+                    "-c:v", "libx264", "-b:v", target_video_bitrate_str,
+                    "-pass", "1", "-passlogfile", log_prefix,
+                    "-an", "-f", "mp4", "NUL"
+                ]
+                
+                try:
+                    subprocess.run(pass1_cmd, check=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                except subprocess.CalledProcessError as e:
+                    raise RuntimeError(f"FFmpegエラー (パス1):\n{e.stderr}")
+
+                self.status_text.set("圧縮中... (2/2 パス)")
+                self.update_idletasks()
+
+                pass2_cmd = [
+                    "ffmpeg", "-i", input_path,
+                    "-c:v", "libx264", "-b:v", target_video_bitrate_str,
+                    "-pass", "2", "-passlogfile", log_prefix,
+                    "-c:a", "aac", "-b:a", audio_bitrate_str,
+                    "-y", output_path
+                ]
+                
+                try:
+                    subprocess.run(pass2_cmd, check=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                except subprocess.CalledProcessError as e:
+                    raise RuntimeError(f"FFmpegエラー (パス2):\n{e.stderr}")
+            
+            final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            if final_size_mb > target_size_mb * 1.1: # Allow 10% margin of error
+                 messagebox.showwarning("警告", f"目標サイズ({target_size_mb:.2f}MB)を少し超えました (結果: {final_size_mb:.2f}MB)。動画の複雑さによって発生することがあります。")
+            return
+
+        # --- Original logic for conversion/quality-preset compression ---
         command = ["ffmpeg", "-i", input_path, "-y"]
         if quality:
             crf_map = {"High": 20, "Medium": 25, "Low": 30}
