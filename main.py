@@ -26,6 +26,9 @@ class ConverterApp(tk.Tk):
         self.available_encoders = []
         self.ffmpeg_available = False
         self.task_queue = Queue()
+        self.worker_thread = None
+        self.current_process = None
+        self.cancel_requested = False
 
         # --- フォーマット定義 ---
         self.image_formats = [
@@ -154,7 +157,11 @@ class ConverterApp(tk.Tk):
         execute_frame.pack(fill=tk.X, padx=10, pady=10)
         self.execute_button = ttk.Button(
             execute_frame, text="実行", command=self.execute_task, state="disabled")
-        self.execute_button.pack(pady=5)
+        self.execute_button.pack(side=tk.LEFT, padx=5, pady=5, expand=True)
+
+        self.cancel_button = ttk.Button(
+            execute_frame, text="中止", command=self.cancel_task, state="disabled")
+        self.cancel_button.pack(side=tk.LEFT, padx=5, pady=5, expand=True)
 
         # --- ステータス表示 ---
         status_label = ttk.Label(
@@ -215,7 +222,9 @@ class ConverterApp(tk.Tk):
             return
 
         self.execute_button["state"] = "disabled"
+        self.cancel_button["state"] = "normal"
         self.status_text.set("処理を開始します...")
+        self.cancel_requested = False
         
         while not self.task_queue.empty():
             try:
@@ -223,10 +232,20 @@ class ConverterApp(tk.Tk):
             except Empty:
                 break
 
-        thread = threading.Thread(target=self._execute_task_threaded)
-        thread.daemon = True
-        thread.start()
+        self.worker_thread = threading.Thread(target=self._execute_task_threaded)
+        self.worker_thread.daemon = True
+        self.worker_thread.start()
         self.process_queue()
+
+    def cancel_task(self):
+        if messagebox.askokcancel("確認", "処理を中止しますか？"):
+            self.cancel_requested = True
+            if self.current_process:
+                try:
+                    self.current_process.kill()
+                except Exception:
+                    pass
+            self.task_queue.put(("cancelled", None))
 
     def _execute_task_threaded(self):
         """This runs in a separate thread."""
@@ -236,7 +255,18 @@ class ConverterApp(tk.Tk):
             else:
                 self.compress_file()
         except Exception as e:
-            self.task_queue.put(("error", e))
+            if not self.cancel_requested:
+                self.task_queue.put(("error", e))
+
+    def _reset_ui_after_task(self, status_message="処理するファイルを選択してください。", success=False):
+        self.status_text.set(status_message)
+        self.execute_button["state"] = "normal"
+        self.cancel_button["state"] = "disabled"
+        self.current_process = None
+        self.worker_thread = None
+        self.cancel_requested = False
+        if success:
+            self.input_file_path.set("")
 
     def process_queue(self):
         """Process messages from the worker thread."""
@@ -247,23 +277,23 @@ class ConverterApp(tk.Tk):
             if msg_type == "status":
                 self.status_text.set(msg_payload)
             elif msg_type == "error":
-                self.status_text.set(f"エラー: {msg_payload}")
-                messagebox.showerror("エラー", f"処理中にエラーが発生しました:\n{msg_payload}")
-                self.execute_button["state"] = "normal"
-                return # Stop polling
+                messagebox.showerror("処理エラー", f"処理中にエラーが発生しました:\n{msg_payload}")
+                self._reset_ui_after_task(f"エラー: {msg_payload}", success=False)
+                return
             elif msg_type == "success":
                 mode, msg = msg_payload
-                self.status_text.set(f"{mode.capitalize()}完了")
-                messagebox.showinfo("成功", msg)
-                self.input_file_path.set("")
-                self.status_text.set("処理するファイルを選択してください。")
-                self.execute_button["state"] = "normal"
-                return # Stop polling
+                messagebox.showinfo("処理終了", msg)
+                self._reset_ui_after_task(f"{mode.capitalize()}完了", success=True)
+                return
+            elif msg_type == "cancelled":
+                messagebox.showwarning("中止", "処理がユーザーによって中断されました。")
+                self._reset_ui_after_task("処理が中断されました。", success=False)
+                return
             elif msg_type == "warning":
                  messagebox.showwarning("警告", msg_payload)
             
         except Empty:
-            pass # No message yet
+            pass
         
         if self.execute_button["state"] == "disabled":
             self.after(100, self.process_queue)
@@ -283,6 +313,9 @@ class ConverterApp(tk.Tk):
 
         self._run_process(input_path, output_path)
         
+        if self.cancel_requested:
+            return
+
         success_msg = f"ファイルの変換が完了しました。\n保存先: {output_path}"
         self.task_queue.put(("success", ("convert", success_msg)))
 
@@ -310,13 +343,17 @@ class ConverterApp(tk.Tk):
 
         self._run_process(input_path, output_path, target_size_mb=target_size, encoder=encoder_codec)
 
+        if self.cancel_requested:
+            return
+
         if os.path.exists(output_path):
             final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
             self.task_queue.put(("status", f"圧縮完了: {os.path.basename(output_path)} ({final_size_mb:.2f}MB)"))
             success_msg = f"ファイルの圧縮が完了しました。\n保存先: {output_path}"
             self.task_queue.put(("success", ("compress", success_msg)))
         else:
-            raise RuntimeError("圧縮ファイルの生成に失敗しました。詳細は警告メッセージを確認してください。")
+            if not self.cancel_requested:
+                raise RuntimeError("圧縮ファイルの生成に失敗しました。詳細は警告メッセージを確認してください。")
 
     def _run_process(self, input_path, output_path, quality=None, target_size_mb=None, encoder=None):
         input_ext = input_path.split('.')[-1].lower()
@@ -330,6 +367,7 @@ class ConverterApp(tk.Tk):
             raise ValueError("対応していないファイル形式です。")
 
     def _process_image(self, input_path, output_path, quality, target_size_mb=None):
+        # Image processing is fast, so we don't add cancellation logic here.
         with Image.open(input_path) as img:
             if target_size_mb is not None:
                 target_bytes = target_size_mb * 1024 * 1024
@@ -344,6 +382,7 @@ class ConverterApp(tk.Tk):
                     img = img.convert('RGB')
 
                 for q in range(95, 5, -5):
+                    if self.cancel_requested: return
                     try:
                         from io import BytesIO
                         buffer = BytesIO()
@@ -391,6 +430,7 @@ class ConverterApp(tk.Tk):
             raise RuntimeError(f"動画の長さの取得に失敗しました: {e}\nffprobeがPATHに設定されているか確認してください。")
 
     def _process_video(self, input_path, output_path, quality, target_size_mb=None, encoder=None):
+        if self.cancel_requested: return
         if target_size_mb is not None:
             encoder = encoder or "libx264"
             try:
@@ -425,9 +465,15 @@ class ConverterApp(tk.Tk):
                 ]
                 
                 try:
-                    subprocess.run(pass1_cmd, check=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                except subprocess.CalledProcessError as e:
-                    raise RuntimeError(f"FFmpegエラー (パス1, {encoder}):\n{e.stderr}")
+                    self.current_process = subprocess.Popen(pass1_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW)
+                    _, stderr = self.current_process.communicate()
+                    if self.current_process.returncode != 0:
+                        if not self.cancel_requested:
+                            raise RuntimeError(f"FFmpegエラー (パス1, {encoder}):\n{stderr}")
+                finally:
+                    self.current_process = None
+
+                if self.cancel_requested: return
 
                 self.task_queue.put(("status", f"圧縮中... (2/2 パス, {encoder})"))
 
@@ -440,10 +486,16 @@ class ConverterApp(tk.Tk):
                 ]
                 
                 try:
-                    subprocess.run(pass2_cmd, check=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-                except subprocess.CalledProcessError as e:
-                    raise RuntimeError(f"FFmpegエラー (パス2, {encoder}):\n{e.stderr}")
+                    self.current_process = subprocess.Popen(pass2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW)
+                    _, stderr = self.current_process.communicate()
+                    if self.current_process.returncode != 0:
+                        if not self.cancel_requested:
+                            raise RuntimeError(f"FFmpegエラー (パス2, {encoder}):\n{stderr}")
+                finally:
+                    self.current_process = None
             
+            if self.cancel_requested: return
+
             if os.path.exists(output_path):
                 final_size_mb = os.path.getsize(output_path) / (1024 * 1024)
                 if final_size_mb > target_size_mb * 1.1:
@@ -459,13 +511,13 @@ class ConverterApp(tk.Tk):
         command.append(output_path)
 
         try:
-            subprocess.run(command, check=True, capture_output=True,
-                           text=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                "FFmpegが見つかりません。PCにインストールし、環境変数PATHに登録してください。")
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"FFmpegエラー:\n{e.stderr}")
+            self.current_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW)
+            _, stderr = self.current_process.communicate()
+            if self.current_process.returncode != 0:
+                if not self.cancel_requested:
+                    raise RuntimeError(f"FFmpegエラー:\n{stderr}")
+        finally:
+            self.current_process = None
 
 
 if __name__ == "__main__":
