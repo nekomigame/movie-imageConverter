@@ -4,3 +4,6 @@ venv/
 build/
 dist/
 __pycache__/
+
+ffmpeg.exe
+ffprobe.exe
