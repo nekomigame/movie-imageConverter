@@ -4,28 +4,31 @@ import os
 import sys
 import subprocess
 from PIL import Image
-import install_ffmpeg
 import threading
 from queue import Queue, Empty
 import shutil
 import tempfile
 import traceback
-import json
+
+# install_ffmpegがない場合のエラーハンドリング
+try:
+    import install_ffmpeg
+except ImportError:
+    install_ffmpeg = None
 
 class ConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ファイルコンバーター＆圧縮ツール")
-        self.geometry("600x600")
+        self.geometry("600x650") # 少し高さを広げた
         
-        # WindowsでのDPIスケーリング対応（文字がぼやけるのを防ぐ）
+        # WindowsでのDPIスケーリング対応
         try:
             from ctypes import windll
             windll.shcore.SetProcessDpiAwareness(1)
         except:
             pass
 
-        # ウィンドウを閉じる時のイベントをフック
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # --- 変数定義 ---
@@ -36,14 +39,13 @@ class ConverterApp(tk.Tk):
         self.selected_format = tk.StringVar()
         self.target_size_mb = tk.StringVar(value="10")
         self.selected_encoder = tk.StringVar()
-        self.quality_var = tk.StringVar(value="Medium") # 画質選択用
+        self.quality_var = tk.StringVar(value="Medium")
         self.available_encoders = []
         self.task_queue = Queue()
         self.worker_thread = None
         self.current_process = None
         self.cancel_requested = False
         
-        # FFmpeg/FFprobeのパス
         self.ffmpeg_path = None
         self.ffprobe_path = None
 
@@ -61,14 +63,10 @@ class ConverterApp(tk.Tk):
             "iso", "m1v", "tod", "vro", "wtv", "xesc", "bin", "nsv", "nuv", "rec"
         ]
 
-        # --- スタイル設定 ---
         self.setup_style()
-
-        # --- 初期化プロセス ---
-        self.locate_binaries() # FFmpegのパスを解決
-        self.setup_ui()        # UI構築
+        self.locate_binaries()
+        self.setup_ui()
         
-        # UI構築後にエンコーダー検出を行う
         if self.ffmpeg_path:
             self.detect_encoders()
         else:
@@ -76,7 +74,6 @@ class ConverterApp(tk.Tk):
 
     def setup_style(self):
         style = ttk.Style()
-        # Windows標準に近いテーマを使用
         if "vista" in style.theme_names():
             style.theme_use("vista")
         elif "winnative" in style.theme_names():
@@ -88,7 +85,6 @@ class ConverterApp(tk.Tk):
         style.configure("Big.TButton", font=("Meiryo UI", 11, "bold"), padding=10)
 
     def on_closing(self):
-        """アプリ終了時のクリーンアップ処理"""
         if self.worker_thread and self.worker_thread.is_alive():
             if messagebox.askokcancel("終了確認", "処理が実行中です。強制終了しますか？"):
                 self.cancel_task()
@@ -96,11 +92,18 @@ class ConverterApp(tk.Tk):
         else:
             self.destroy()
 
+    def get_base_dir(self):
+        """実行環境に応じたベースディレクトリを取得"""
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+        else:
+            return os.path.dirname(os.path.abspath(__file__))
+
     def locate_binaries(self):
-        """ローカルディレクトリ、またはPATHからFFmpeg/FFprobeを探す"""
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        local_ffmpeg = os.path.join(current_dir, "ffmpeg.exe")
-        local_ffprobe = os.path.join(current_dir, "ffprobe.exe")
+        """FFmpeg/FFprobeを探す"""
+        base_dir = self.get_base_dir()
+        local_ffmpeg = os.path.join(base_dir, "ffmpeg.exe")
+        local_ffprobe = os.path.join(base_dir, "ffprobe.exe")
         
         if os.path.exists(local_ffmpeg):
             self.ffmpeg_path = local_ffmpeg
@@ -115,14 +118,18 @@ class ConverterApp(tk.Tk):
     def check_and_install_ffmpeg(self):
         if not self.ffmpeg_path:
             self.available_encoders = [("CPU (libx264)", "libx264")]
-            if messagebox.askyesno("FFmpeg不足", "動画処理に必要なFFmpegが見つかりません。\n自動的にダウンロードしてインストールしますか？"):
-                self.status_text.set("FFmpegをダウンロード中...")
-                self.execute_button["state"] = "disabled"
-                threading.Thread(target=self._download_ffmpeg_thread, daemon=True).start()
+            if install_ffmpeg:
+                if messagebox.askyesno("FFmpeg不足", "動画処理に必要なFFmpegが見つかりません。\n自動的にダウンロードしてインストールしますか？"):
+                    self.status_text.set("FFmpegをダウンロード中...")
+                    self.execute_button["state"] = "disabled"
+                    threading.Thread(target=self._download_ffmpeg_thread, daemon=True).start()
+                else:
+                    self.status_text.set("警告: FFmpegがないため、動画機能は制限されます。")
             else:
-                self.status_text.set("警告: FFmpegがないため、動画機能は制限されます。")
+                self.status_text.set("警告: FFmpegが見つかりません。手動でインストールしてください。")
 
     def _download_ffmpeg_thread(self):
+        if not install_ffmpeg: return
         try:
             def progress_callback(msg):
                 self.task_queue.put(("status", msg))
@@ -132,10 +139,11 @@ class ConverterApp(tk.Tk):
             self.task_queue.put(("error", f"ダウンロードエラー: {e}"))
 
     def detect_encoders(self):
-        """利用可能なH.264ハードウェアエンコーダーを検出し、メニューを更新する"""
+        """エンコーダー検出"""
         self.available_encoders = [("CPU (libx264)", "libx264")]
         if self.ffmpeg_path:
             try:
+                # Windows固有のウィンドウ非表示設定
                 startupinfo = None
                 if os.name == 'nt':
                     startupinfo = subprocess.STARTUPINFO()
@@ -144,7 +152,7 @@ class ConverterApp(tk.Tk):
                 result = subprocess.run(
                     [self.ffmpeg_path, "-encoders"],
                     capture_output=True, text=True, check=True,
-                    startupinfo=startupinfo
+                    startupinfo=startupinfo, encoding='utf-8', errors='ignore'
                 )
                 output = result.stdout
                 
@@ -161,24 +169,21 @@ class ConverterApp(tk.Tk):
     def update_encoder_menu(self):
         menu_values = [name for name, codec in self.available_encoders]
         
-        # 各タブ内のエンコーダーメニューを更新
         if hasattr(self, 'encoder_menu_compress'):
             self.encoder_menu_compress["values"] = menu_values
         if hasattr(self, 'encoder_menu_convert'):
             self.encoder_menu_convert["values"] = menu_values
 
-        if menu_values:
+        if menu_values and not self.selected_encoder.get():
             self.selected_encoder.set(menu_values[0])
+        elif self.selected_encoder.get() not in menu_values:
+             if menu_values: self.selected_encoder.set(menu_values[0])
 
-    # --------------------------------------------------------------------------
-    # UI構築 (直感的なタブレイアウトに変更)
-    # --------------------------------------------------------------------------
     def setup_ui(self):
-        # メインコンテナ
         main_frame = ttk.Frame(self, padding=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 1. ファイル選択エリア (最上部)
+        # 1. ファイル選択
         file_frame = ttk.LabelFrame(main_frame, text="1. ファイルを選択", padding=(15, 10))
         file_frame.pack(fill=tk.X, pady=(0, 15))
 
@@ -191,30 +196,24 @@ class ConverterApp(tk.Tk):
         browse_btn = ttk.Button(input_row, text="参照...", command=self.select_file, width=10)
         browse_btn.pack(side=tk.LEFT)
 
-        # ファイル情報表示ラベル
         self.info_label = ttk.Label(file_frame, textvariable=self.file_info_text, foreground="gray", font=("Meiryo UI", 9))
         self.info_label.pack(anchor="w", pady=(5, 0))
 
-
-        # 2. 設定エリア (タブ切り替え)
+        # 2. 設定エリア
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
 
-        # --- タブ1: 変換モード ---
         self.tab_convert = ttk.Frame(self.notebook, padding=15)
         self.notebook.add(self.tab_convert, text='  フォーマット変換 / 画質変更  ')
         self.setup_convert_tab(self.tab_convert)
 
-        # --- タブ2: 圧縮モード ---
         self.tab_compress = ttk.Frame(self.notebook, padding=15)
         self.notebook.add(self.tab_compress, text='  サイズ指定圧縮  ')
         self.setup_compress_tab(self.tab_compress)
         
-        # タブ切り替えイベント
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
 
-
-        # 3. 実行エリア (最下部)
+        # 3. 実行エリア
         action_frame = ttk.Frame(main_frame)
         action_frame.pack(fill=tk.X, side=tk.BOTTOM)
 
@@ -232,7 +231,6 @@ class ConverterApp(tk.Tk):
             btn_grid, text="中止", command=self.cancel_task, state="disabled")
         self.cancel_button.pack(side=tk.LEFT, fill=tk.Y)
 
-        # ステータスバー
         status_bar = ttk.Label(self, textvariable=self.status_text, relief="sunken", anchor="w", padding=(5, 2))
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -240,20 +238,15 @@ class ConverterApp(tk.Tk):
         self.process_queue()
 
     def setup_convert_tab(self, parent):
-        """変換タブの中身"""
         grid_frame = ttk.Frame(parent)
         grid_frame.pack(fill=tk.X)
-        
-        # グリッド設定
         grid_frame.columnconfigure(1, weight=1)
 
-        # 変換後フォーマット
         ttk.Label(grid_frame, text="変換後の形式:", font=("Meiryo UI", 10, "bold")).grid(row=0, column=0, sticky="w", pady=10)
         self.format_menu = ttk.Combobox(grid_frame, textvariable=self.selected_format, state="disabled", width=15, font=("Meiryo UI", 10))
         self.format_menu.grid(row=0, column=1, sticky="w", padx=10, pady=10)
         ttk.Label(grid_frame, text="(現在の拡張子も選択可能)").grid(row=0, column=2, sticky="w")
 
-        # 画質設定
         ttk.Label(grid_frame, text="画質設定:", font=("Meiryo UI", 10, "bold")).grid(row=1, column=0, sticky="w", pady=10)
         quality_menu = ttk.Combobox(
             grid_frame, textvariable=self.quality_var, 
@@ -261,7 +254,6 @@ class ConverterApp(tk.Tk):
         quality_menu.grid(row=1, column=1, sticky="w", padx=10, pady=10)
         ttk.Label(grid_frame, text="※Originalは可能な限り無劣化コピー").grid(row=1, column=2, sticky="w")
 
-        # エンコーダー (動画用)
         ttk.Label(grid_frame, text="エンコーダー:", font=("Meiryo UI", 10, "bold")).grid(row=2, column=0, sticky="w", pady=10)
         self.encoder_menu_convert = ttk.Combobox(
             grid_frame, textvariable=self.selected_encoder, state="readonly", width=30, font=("Meiryo UI", 10))
@@ -269,13 +261,10 @@ class ConverterApp(tk.Tk):
         ttk.Label(grid_frame, text="※動画変換時のみ有効").grid(row=3, column=1, sticky="w", padx=10)
 
     def setup_compress_tab(self, parent):
-        """圧縮タブの中身"""
         grid_frame = ttk.Frame(parent)
         grid_frame.pack(fill=tk.X)
-        
         grid_frame.columnconfigure(1, weight=1)
 
-        # 目標サイズ
         ttk.Label(grid_frame, text="目標ファイルサイズ:", font=("Meiryo UI", 10, "bold")).grid(row=0, column=0, sticky="w", pady=10)
         size_box = ttk.Frame(grid_frame)
         size_box.grid(row=0, column=1, sticky="w", padx=10, pady=10)
@@ -283,7 +272,6 @@ class ConverterApp(tk.Tk):
         ttk.Entry(size_box, textvariable=self.target_size_mb, width=10, font=("Meiryo UI", 10)).pack(side=tk.LEFT)
         ttk.Label(size_box, text="MB").pack(side=tk.LEFT, padx=5)
 
-        # エンコーダー
         ttk.Label(grid_frame, text="エンコーダー:", font=("Meiryo UI", 10, "bold")).grid(row=1, column=0, sticky="w", pady=10)
         self.encoder_menu_compress = ttk.Combobox(
             grid_frame, textvariable=self.selected_encoder, state="readonly", width=30, font=("Meiryo UI", 10))
@@ -293,15 +281,10 @@ class ConverterApp(tk.Tk):
         info_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=20)
 
     def on_tab_change(self, event):
-        """タブ切り替え時にモード変数を更新"""
         current_tab = self.notebook.index(self.notebook.select())
-        if current_tab == 0:
-            self.mode.set("convert")
-        else:
-            self.mode.set("compress")
+        self.mode.set("convert" if current_tab == 0 else "compress")
 
     def update_file_info(self, filepath):
-        """選択されたファイルの情報を表示"""
         try:
             size_bytes = os.path.getsize(filepath)
             size_mb = size_bytes / (1024 * 1024)
@@ -309,7 +292,6 @@ class ConverterApp(tk.Tk):
             
             info = f"サイズ: {size_mb:.2f} MB | 形式: {ext}"
             
-            # 画像なら解像度も表示
             if ext.replace('.', '') in self.image_formats:
                 try:
                     with Image.open(filepath) as img:
@@ -318,7 +300,7 @@ class ConverterApp(tk.Tk):
                     pass
             
             self.file_info_text.set(info)
-            self.info_label.config(foreground="#005500") # 緑色にして正常認識を示す
+            self.info_label.config(foreground="#005500")
         except Exception:
             self.file_info_text.set("ファイル情報の取得に失敗しました")
             self.info_label.config(foreground="red")
@@ -330,16 +312,10 @@ class ConverterApp(tk.Tk):
         
         filetypes = [
             ("メディアファイル", " ".join(media_exts)),
-            ("動画ファイル", " ".join([f"*.{ext}" for ext in self.video_formats])),
-            ("画像ファイル", " ".join([f"*.{ext}" for ext in self.image_formats])),
             ("すべてのファイル", "*.*")
         ]
 
-        try:
-            filepath = filedialog.askopenfilename(filetypes=filetypes)
-        except Exception:
-            filepath = filedialog.askopenfilename(filetypes=[("すべてのファイル", "*.*")])
-
+        filepath = filedialog.askopenfilename(filetypes=filetypes)
         if not filepath: return
 
         self.input_file_path.set(filepath)
@@ -352,24 +328,19 @@ class ConverterApp(tk.Tk):
         ext = self.input_file_path.get().split('.')[-1].lower()
         target_formats = []
         
-        if ext in self.image_formats:
+        if ext.replace('.', '') in self.image_formats:
             target_formats = [f for f in self.image_formats]
         else:
-            common_outputs = [
-                "mp4", "mkv", "mov", "avi", "webm", "flv", "gif"
-            ]
+            common_outputs = ["mp4", "mkv", "mov", "avi", "webm", "flv", "gif"]
             target_formats = [f for f in common_outputs]
-            # 現在の拡張子がリストにない場合は追加する
-            if ext not in target_formats:
-                target_formats.append(ext)
+            if ext.replace('.', '') not in target_formats:
+                target_formats.append(ext.replace('.', ''))
 
         self.format_menu["values"] = target_formats
         self.format_menu["state"] = "normal"
-        self.selected_format.set(ext)
-
-    # --------------------------------------------------------------------------
-    # 処理ロジック (変更なし、以前の修正済みロジックを維持)
-    # --------------------------------------------------------------------------
+        # コンボボックスにピリオドなしで設定
+        current_ext = ext.replace('.', '')
+        self.selected_format.set(current_ext)
 
     def execute_task(self):
         if not self.input_file_path.get():
@@ -391,6 +362,7 @@ class ConverterApp(tk.Tk):
         self.status_text.set("処理を開始します...")
         self.cancel_requested = False
         
+        # 古いキューをクリア
         while not self.task_queue.empty():
             try: self.task_queue.get_nowait()
             except Empty: break
@@ -437,6 +409,7 @@ class ConverterApp(tk.Tk):
             
     def process_queue(self):
         try:
+            # キュー内のすべてのメッセージを処理するループ
             while True:
                 message = self.task_queue.get_nowait()
                 msg_type, msg_payload = message
@@ -477,6 +450,7 @@ class ConverterApp(tk.Tk):
         target_ext = params["target_ext"]
         quality = params["quality"]
         selected_encoder_name = params.get("selected_encoder")
+        
         encoder_codec = "libx264"
         for name, codec in self.available_encoders:
             if name == selected_encoder_name:
@@ -485,13 +459,17 @@ class ConverterApp(tk.Tk):
         
         if not target_ext:
             target_ext = input_path.split('.')[-1]
+        
+        # ピリオドが含まれていなければ付与
+        if not target_ext.startswith('.'):
+            target_ext = '.' + target_ext
 
         directory, filename = os.path.split(input_path)
         name_without_ext = os.path.splitext(filename)[0]
-        output_path = os.path.join(directory, f"{name_without_ext}_converted.{target_ext}")
+        output_path = os.path.join(directory, f"{name_without_ext}_converted{target_ext}")
 
         if os.path.abspath(input_path) == os.path.abspath(output_path):
-             output_path = os.path.join(directory, f"{name_without_ext}_new.{target_ext}")
+             output_path = os.path.join(directory, f"{name_without_ext}_new{target_ext}")
 
         self.task_queue.put(("status", f"変換中({quality}, {encoder_codec})... -> {os.path.basename(output_path)}"))
         self._run_process(input_path, output_path, quality=quality, encoder=encoder_codec)
@@ -501,6 +479,10 @@ class ConverterApp(tk.Tk):
             self.task_queue.put(("success", ("変換", success_msg)))
         else:
             self.task_queue.put(("cancelled", None))
+            # キャンセル時は不完全なファイルを削除
+            if os.path.exists(output_path):
+                try: os.remove(output_path)
+                except: pass
 
     def compress_file(self, params):
         try:
@@ -509,7 +491,7 @@ class ConverterApp(tk.Tk):
         except ValueError:
             raise ValueError("目標ファイルサイズには正しい数値を入力してください。")
 
-        selected_encoder_name = params["selected_encoder"]
+        selected_encoder_name = params.get("selected_encoder")
         encoder_codec = "libx264"
         for name, codec in self.available_encoders:
             if name == selected_encoder_name:
@@ -545,7 +527,7 @@ class ConverterApp(tk.Tk):
             raise RuntimeError("出力ファイルが生成されませんでした。")
 
     def _run_process(self, input_path, output_path, quality=None, target_size_mb=None, encoder=None):
-        input_ext = input_path.split('.')[-1].lower()
+        input_ext = input_path.split('.')[-1].lower().replace('.', '')
         
         if input_ext in self.image_formats:
             self._process_image(input_path, output_path, quality, target_size_mb=target_size_mb)
@@ -556,36 +538,34 @@ class ConverterApp(tk.Tk):
 
     def _process_image(self, input_path, output_path, quality, target_size_mb=None):
         with Image.open(input_path) as img:
-            output_ext = output_path.split('.')[-1].lower()
+            output_ext = output_path.split('.')[-1].lower().replace('.', '')
             
-            if output_ext in ('jpg', 'jpeg') and img.mode in ('RGBA', 'LA'):
-                background = Image.new("RGB", img.size, (255, 255, 255))
-                background.paste(img, mask=img.split()[-1])
-                img = background
-            elif output_ext in ('jpg', 'jpeg') and img.mode == 'P':
-                 img = img.convert('RGB')
+            # アルファチャンネル処理
+            if output_ext in ('jpg', 'jpeg') and img.mode in ('RGBA', 'LA', 'P'):
+                if img.mode == 'P':
+                    img = img.convert('RGB')
+                else:
+                    background = Image.new("RGB", img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[-1])
+                    img = background
 
             if target_size_mb is not None:
-                target_bytes = target_size_mb * 1024 * 1024
-
+                # 目標サイズ圧縮ロジック
                 if output_ext not in ('jpg', 'jpeg', 'webp'):
                     self.task_queue.put(("warning", f"目標サイズ圧縮はJPG/WebPのみ対応しています。通常の変換を行います。"))
                     img.save(output_path)
                     return
 
-                low, high = 1, 95
-                best_quality = 5
+                target_bytes = target_size_mb * 1024 * 1024
+                low, high = 1, 100
+                best_quality = 50 # デフォルト
                 
                 from io import BytesIO
                 
-                buffer = BytesIO()
-                img_format = 'JPEG' if output_ext in ('jpg', 'jpeg') else output_ext.upper()
-                img.save(buffer, format=img_format, quality=high)
-                if buffer.tell() <= target_bytes:
-                    with open(output_path, 'wb') as f:
-                        f.write(buffer.getvalue())
-                    return
-
+                # フォーマット決定
+                img_format = 'JPEG' if output_ext in ('jpg', 'jpeg') else 'WEBP'
+                
+                # 二分探索で最適な画質を探す
                 while low <= high:
                     if self.cancel_requested: return
                     mid = (low + high) // 2
@@ -602,10 +582,11 @@ class ConverterApp(tk.Tk):
                 img.save(output_path, quality=best_quality)
                 
                 final_size = os.path.getsize(output_path)
-                if final_size > target_bytes:
+                if final_size > target_bytes * 1.05: # 5%程度の誤差は許容
                      self.task_queue.put(("warning", f"最低画質でも目標サイズを超過しました ({final_size/(1024*1024):.2f}MB)。"))
                 return
 
+            # 通常画質設定
             options = {}
             if quality == "Original":
                 if output_ext in ('jpg', 'jpeg'):
@@ -620,8 +601,42 @@ class ConverterApp(tk.Tk):
             
             img.save(output_path, **options)
 
+    def _run_ffmpeg_command(self, command, description="処理中"):
+        """FFmpegコマンドを実行する共通メソッド"""
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        # ログ出力用（デバッグ時）
+        # print(f"Running: {' '.join(command)}")
+
+        self.current_process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+            text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo
+        )
+        _, stderr = self.current_process.communicate()
+        
+        if self.current_process.returncode != 0:
+            if not self.cancel_requested:
+                # エラー解析とヒントの生成
+                hint = ""
+                if "Bitstream not supported" in stderr or "libaom-av1" in stderr:
+                    hint = "\n【ヒント】入力ファイル(AV1等)がこのFFmpegバージョンでサポートされていないか、破損しています。"
+                elif "Corrupt frame" in stderr:
+                    hint = "\n【ヒント】ファイルの一部が破損しています。"
+                
+                # ログを短縮して表示
+                lines = stderr.splitlines()
+                log_tail = "\n".join(lines[-20:]) if len(lines) > 20 else stderr
+                
+                raise RuntimeError(f"FFmpegエラー ({description}):{hint}\n\n--- ログ末尾 ---\n{log_tail}")
+        
+        return stderr
+
     def _get_video_duration(self, input_path):
         if not self.ffprobe_path: raise RuntimeError("ffprobeが見つかりません。")
+        
         startupinfo = None
         if os.name == 'nt':
             startupinfo = subprocess.STARTUPINFO()
@@ -632,7 +647,7 @@ class ConverterApp(tk.Tk):
             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input_path
         ]
         result = subprocess.run(
-            command, check=True, capture_output=True, text=True, startupinfo=startupinfo
+            command, check=False, capture_output=True, text=True, startupinfo=startupinfo
         )
         try:
             return float(result.stdout.strip())
@@ -660,111 +675,100 @@ class ConverterApp(tk.Tk):
 
     def _process_video(self, input_path, output_path, quality, target_size_mb=None, encoder=None):
         if self.cancel_requested: return
-        startupinfo = None
-        if os.name == 'nt':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
+        
         has_audio = self._has_audio_stream(input_path)
+        encoder = encoder or "libx264"
 
         # --- 目標サイズ指定（2パスエンコード） ---
         if target_size_mb is not None:
-            encoder = encoder or "libx264"
             try:
                 duration = self._get_video_duration(input_path)
             except Exception as e:
                  raise RuntimeError(f"動画情報の取得失敗: {e}")
 
+            # ビットレート計算 (kbits/s)
+            # サイズ(MB) * 8192 (kbit/MB) / 秒数
+            target_total_bitrate_kbps = (target_size_mb * 8192) / duration
+            
+            # 音声ビットレートの考慮
             audio_bitrate_kbps = 128 if has_audio else 0
-            target_total_bitrate_kbps = (target_size_mb * 1024 * 8) / duration
+            
+            # 全体が小さすぎる場合は音声を削る
+            if target_total_bitrate_kbps < audio_bitrate_kbps + 50: # 映像に最低50kbps残す
+                 audio_bitrate_kbps = 64 # 音質を落とす
+            
             target_video_bitrate_kbps = target_total_bitrate_kbps - audio_bitrate_kbps
 
-            if target_video_bitrate_kbps < 50:
+            if target_video_bitrate_kbps < 100:
                 self.task_queue.put(("warning", "目標サイズが極端に小さいため、画質が大幅に低下します。"))
-                target_video_bitrate_kbps = max(30, target_video_bitrate_kbps)
+                target_video_bitrate_kbps = max(30, target_video_bitrate_kbps) # 最低30kbps確保
 
             target_video_bitrate_str = f"{int(target_video_bitrate_kbps)}k"
             audio_bitrate_str = f"{audio_bitrate_kbps}k"
             
             with tempfile.TemporaryDirectory() as tempdir:
+                # Windowsのパス区切り問題を回避するためにスラッシュ置換
                 log_prefix = os.path.join(tempdir, "ffmpeg2pass").replace('\\', '/')
                 null_device = "NUL" if os.name == 'nt' else "/dev/null"
 
                 self.task_queue.put(("status", f"圧縮中... (1/2 パス, {encoder})"))
                 
+                # パス1コマンド（堅牢化フラグ追加）
                 pass1_cmd = [
-                    self.ffmpeg_path, "-y", "-i", input_path,
+                    self.ffmpeg_path, "-y",
+                    "-err_detect", "ignore_err", # 軽微なエラーを無視
+                    "-i", input_path,
                     "-c:v", encoder, "-b:v", target_video_bitrate_str,
                     "-pass", "1", "-passlogfile", log_prefix,
                     "-an",
                     "-f", "mp4", null_device
                 ]
                 
-                self.current_process = subprocess.Popen(
-                    pass1_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                    text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo
-                )
-                _, stderr = self.current_process.communicate()
-                
-                if self.current_process.returncode != 0 and not self.cancel_requested:
-                     raise RuntimeError(f"FFmpeg Pass1 エラー:\n{stderr}")
+                self._run_ffmpeg_command(pass1_cmd, description="Pass 1")
                 
                 if self.cancel_requested: return
 
                 self.task_queue.put(("status", f"圧縮中... (2/2 パス, {encoder})"))
 
                 pass2_cmd = [
-                    self.ffmpeg_path, "-i", input_path,
+                    self.ffmpeg_path,
+                    "-err_detect", "ignore_err",
+                    "-i", input_path,
                     "-c:v", encoder, "-b:v", target_video_bitrate_str,
                     "-pass", "2", "-passlogfile", log_prefix,
                 ]
 
-                if has_audio:
+                if has_audio and audio_bitrate_kbps > 0:
                     pass2_cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate_str])
                 else:
                     pass2_cmd.append("-an")
 
                 pass2_cmd.extend(["-y", output_path])
                 
-                self.current_process = subprocess.Popen(
-                    pass2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                    text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo
-                )
-                _, stderr = self.current_process.communicate()
-                
-                if self.current_process.returncode != 0 and not self.cancel_requested:
-                    raise RuntimeError(f"FFmpeg Pass2 エラー:\n{stderr}")
+                self._run_ffmpeg_command(pass2_cmd, description="Pass 2")
             return
 
         # --- 通常変換モード ---
         output_ext = output_path.split('.')[-1].lower()
-        
         need_reencode = True
         
         if quality == "Original":
              command = [
-                self.ffmpeg_path, "-i", input_path,
+                self.ffmpeg_path, 
+                "-err_detect", "ignore_err",
+                "-i", input_path,
                 "-c", "copy",
                 "-y", output_path
             ]
              
-             self.current_process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo
-            )
-             _, stderr = self.current_process.communicate()
-             
-             if self.current_process.returncode == 0:
-                 need_reencode = False
-             elif self.cancel_requested:
-                 return
-             else:
-                 self.task_queue.put(("warning", "ストリームコピー不可のため、自動的に再エンコードします。"))
+             try:
+                self._run_ffmpeg_command(command, description="Stream Copy")
+                need_reencode = False
+             except RuntimeError:
+                 if self.cancel_requested: return
+                 self.task_queue.put(("warning", "ストリームコピーに失敗しました。自動的に再エンコードします。"))
                  quality = "High"
-                 encoder = encoder or "libx264"
                  need_reencode = True
-        else:
-             need_reencode = True
 
         if not need_reencode:
             return
@@ -774,11 +778,12 @@ class ConverterApp(tk.Tk):
             "m4v", "mts", "f4v", "3g2"
         ]
 
+        # 選択したエンコーダーが使えるコンテナかどうか判定
         if output_ext in supported_x264_containers:
-            encoder = encoder or "libx264"
-            
             command = [
-                self.ffmpeg_path, "-i", input_path,
+                self.ffmpeg_path,
+                "-err_detect", "ignore_err", 
+                "-i", input_path,
                 "-c:v", encoder,
             ]
             
@@ -809,21 +814,16 @@ class ConverterApp(tk.Tk):
             
         else:
             if quality != "Original":
-                self.task_queue.put(("status", f"変換中... (形式 {output_ext} は選択されたHWエンコード未対応のため標準変換)"))
+                self.task_queue.put(("status", f"変換中... (形式 {output_ext} はHWエンコード未対応のため標準変換)"))
 
             command = [
-                self.ffmpeg_path, "-i", input_path,
+                self.ffmpeg_path, 
+                "-err_detect", "ignore_err",
+                "-i", input_path,
                 "-y", output_path
             ]
         
-        self.current_process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-            text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo
-        )
-        _, stderr = self.current_process.communicate()
-        
-        if self.current_process.returncode != 0 and not self.cancel_requested:
-            raise RuntimeError(f"FFmpeg エラー:\n{stderr}")
+        self._run_ffmpeg_command(command, description="Encoding")
 
 if __name__ == "__main__":
     app = ConverterApp()
