@@ -16,13 +16,21 @@ class ConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ファイルコンバーター＆圧縮ツール")
-        self.geometry("650x550")
+        self.geometry("600x600")
+        
+        # WindowsでのDPIスケーリング対応（文字がぼやけるのを防ぐ）
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except:
+            pass
 
         # ウィンドウを閉じる時のイベントをフック
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # --- 変数定義 ---
         self.input_file_path = tk.StringVar()
+        self.file_info_text = tk.StringVar(value="ファイル未選択")
         self.status_text = tk.StringVar(value="処理するファイルを選択してください。")
         self.mode = tk.StringVar(value="convert")
         self.selected_format = tk.StringVar()
@@ -40,21 +48,21 @@ class ConverterApp(tk.Tk):
         self.ffprobe_path = None
 
         # --- フォーマット定義 ---
-        # Pillowで処理する画像形式
         self.image_formats = [
             "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff",
             "ico", "tga", "ppm"
         ]
         
-        # FFmpegで処理する形式 (動画のみ)
         self.video_formats = [
-            # 一般的な動画
             "mp4", "mkv", "mov", "avi", "wmv", "webm", "flv", "mpg", "mpeg", 
             "ts", "m2ts", "3gp", "3g2", "m4v", "vob", "ogv", "mts", "mxf",
             "rm", "rmvb", "asf", "amv", "divx", "f4v", "m2v", "mpe", "mpv", 
             "mpeg1", "mpeg2", "mpeg4", "ogm", "ogx", "dv", "drc", "gvi", 
             "iso", "m1v", "tod", "vro", "wtv", "xesc", "bin", "nsv", "nuv", "rec"
         ]
+
+        # --- スタイル設定 ---
+        self.setup_style()
 
         # --- 初期化プロセス ---
         self.locate_binaries() # FFmpegのパスを解決
@@ -65,6 +73,19 @@ class ConverterApp(tk.Tk):
             self.detect_encoders()
         else:
             self.after(500, self.check_and_install_ffmpeg)
+
+    def setup_style(self):
+        style = ttk.Style()
+        # Windows標準に近いテーマを使用
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        elif "winnative" in style.theme_names():
+            style.theme_use("winnative")
+            
+        style.configure("TButton", padding=6)
+        style.configure("TLabel", padding=2)
+        style.configure("TLabelframe", padding=10)
+        style.configure("Big.TButton", font=("Meiryo UI", 11, "bold"), padding=10)
 
     def on_closing(self):
         """アプリ終了時のクリーンアップ処理"""
@@ -78,11 +99,9 @@ class ConverterApp(tk.Tk):
     def locate_binaries(self):
         """ローカルディレクトリ、またはPATHからFFmpeg/FFprobeを探す"""
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        
         local_ffmpeg = os.path.join(current_dir, "ffmpeg.exe")
         local_ffprobe = os.path.join(current_dir, "ffprobe.exe")
         
-        # 優先順位: カレントディレクトリ > PATH
         if os.path.exists(local_ffmpeg):
             self.ffmpeg_path = local_ffmpeg
         else:
@@ -99,30 +118,22 @@ class ConverterApp(tk.Tk):
             if messagebox.askyesno("FFmpeg不足", "動画処理に必要なFFmpegが見つかりません。\n自動的にダウンロードしてインストールしますか？"):
                 self.status_text.set("FFmpegをダウンロード中...")
                 self.execute_button["state"] = "disabled"
-                
-                # ダウンロードを別スレッドで実行
                 threading.Thread(target=self._download_ffmpeg_thread, daemon=True).start()
             else:
                 self.status_text.set("警告: FFmpegがないため、動画機能は制限されます。")
 
     def _download_ffmpeg_thread(self):
         try:
-            # 進捗表示用のコールバック
             def progress_callback(msg):
                 self.task_queue.put(("status", msg))
-
             install_ffmpeg.download_and_extract(progress_callback=progress_callback)
-            
-            # メインスレッドで再検出を実行させる
             self.task_queue.put(("ffmpeg_installed", None))
-            
         except Exception as e:
             self.task_queue.put(("error", f"ダウンロードエラー: {e}"))
 
     def detect_encoders(self):
         """利用可能なH.264ハードウェアエンコーダーを検出し、メニューを更新する"""
         self.available_encoders = [("CPU (libx264)", "libx264")]
-        
         if self.ffmpeg_path:
             try:
                 startupinfo = None
@@ -143,137 +154,174 @@ class ConverterApp(tk.Tk):
                     self.available_encoders.append(("Intel GPU (qsv)", "h264_qsv"))
                 if "h264_amf" in output:
                     self.available_encoders.append(("AMD GPU (amf)", "h264_amf"))
-
             except Exception:
                 pass 
-
         self.update_encoder_menu()
 
     def update_encoder_menu(self):
-        """検出されたエンコーダーをドロップダウンリストに反映させる"""
-        # メニュー項目
         menu_values = [name for name, codec in self.available_encoders]
         
-        # 圧縮用メニュー更新
-        if hasattr(self, 'encoder_menu'):
-            self.encoder_menu["values"] = menu_values
-        
-        # 変換用メニュー更新
-        if hasattr(self, 'convert_encoder_menu'):
-            self.convert_encoder_menu["values"] = menu_values
+        # 各タブ内のエンコーダーメニューを更新
+        if hasattr(self, 'encoder_menu_compress'):
+            self.encoder_menu_compress["values"] = menu_values
+        if hasattr(self, 'encoder_menu_convert'):
+            self.encoder_menu_convert["values"] = menu_values
 
-        # 初期選択
         if menu_values:
             self.selected_encoder.set(menu_values[0])
 
+    # --------------------------------------------------------------------------
+    # UI構築 (直感的なタブレイアウトに変更)
+    # --------------------------------------------------------------------------
     def setup_ui(self):
-        # --- ファイル選択 ---
-        file_frame = ttk.LabelFrame(self, text="1. ファイル選択", padding=(10, 5))
-        file_frame.pack(fill=tk.X, padx=10, pady=5)
+        # メインコンテナ
+        main_frame = ttk.Frame(self, padding=15)
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-        file_entry = ttk.Entry(
-            file_frame, textvariable=self.input_file_path, state="readonly", width=60)
-        file_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5, pady=5)
-        browse_button = ttk.Button(
-            file_frame, text="選択...", command=self.select_file)
-        browse_button.pack(side=tk.LEFT, padx=5, pady=5)
+        # 1. ファイル選択エリア (最上部)
+        file_frame = ttk.LabelFrame(main_frame, text="1. ファイルを選択", padding=(15, 10))
+        file_frame.pack(fill=tk.X, pady=(0, 15))
 
-        # --- モード選択 ---
-        mode_frame = ttk.LabelFrame(self, text="2. モード選択", padding=(10, 5))
-        mode_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        convert_radio = ttk.Radiobutton(
-            mode_frame, text="拡張子変換 / 画質変更", variable=self.mode, value="convert", command=self.toggle_mode)
-        convert_radio.pack(side=tk.LEFT, padx=10)
-        compress_radio = ttk.Radiobutton(
-            mode_frame, text="目標サイズで圧縮", variable=self.mode, value="compress", command=self.toggle_mode)
-        compress_radio.pack(side=tk.LEFT, padx=10)
-
-        # --- オプション ---
-        self.options_container = tk.Frame(self)
-        self.options_container.pack(fill=tk.X, padx=10, pady=5)
-
-        # 変換オプション（通常モード）
-        self.convert_frame = ttk.LabelFrame(
-            self.options_container, text="3. 変換設定", padding=(10, 5))
+        input_row = ttk.Frame(file_frame)
+        input_row.pack(fill=tk.X)
         
-        # 1行目: 形式と画質
-        row1 = tk.Frame(self.convert_frame)
-        row1.pack(fill=tk.X, pady=2)
-        ttk.Label(row1, text="変換後形式:").pack(side=tk.LEFT, padx=5)
-        self.format_menu = ttk.Combobox(
-            row1, textvariable=self.selected_format, state="disabled", width=10)
-        self.format_menu.pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(row1, text="画質:").pack(side=tk.LEFT, padx=(15, 5))
-        quality_menu = ttk.Combobox(
-            row1, textvariable=self.quality_var, 
-            values=["Original", "High", "Medium", "Low"], state="readonly", width=10)
-        quality_menu.pack(side=tk.LEFT, padx=5)
-
-        # 2行目: エンコーダー選択
-        row2 = tk.Frame(self.convert_frame)
-        row2.pack(fill=tk.X, pady=5)
-        ttk.Label(row2, text="エンコーダー(動画):").pack(side=tk.LEFT, padx=5)
-        self.convert_encoder_menu = ttk.Combobox(
-            row2, textvariable=self.selected_encoder, state="readonly", width=30)
-        self.convert_encoder_menu.pack(side=tk.LEFT, padx=5)
-
-
-        # 圧縮オプション（サイズ指定モード）
-        self.compress_frame = ttk.LabelFrame(
-            self.options_container, text="3. 圧縮設定 (2パスエンコード)", padding=(10, 5))
+        self.file_entry = ttk.Entry(input_row, textvariable=self.input_file_path, state="readonly", font=("Meiryo UI", 10))
+        self.file_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 10))
         
-        size_label = ttk.Label(self.compress_frame, text="目標ファイルサイズ(MB):")
-        size_label.pack(side=tk.LEFT, padx=5, pady=5)
-        self.size_entry = ttk.Entry(
-            self.compress_frame, textvariable=self.target_size_mb, width=10)
-        self.size_entry.pack(side=tk.LEFT, padx=5, pady=5)
+        browse_btn = ttk.Button(input_row, text="参照...", command=self.select_file, width=10)
+        browse_btn.pack(side=tk.LEFT)
 
-        encoder_label = ttk.Label(self.compress_frame, text="エンコーダー(動画のみ):")
-        encoder_label.pack(side=tk.LEFT, padx=(10, 5), pady=5)
-        self.encoder_menu = ttk.Combobox(
-            self.compress_frame, textvariable=self.selected_encoder, state="readonly", width=30)
-        self.encoder_menu.pack(side=tk.LEFT, padx=5, pady=5)
+        # ファイル情報表示ラベル
+        self.info_label = ttk.Label(file_frame, textvariable=self.file_info_text, foreground="gray", font=("Meiryo UI", 9))
+        self.info_label.pack(anchor="w", pady=(5, 0))
+
+
+        # 2. 設定エリア (タブ切り替え)
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
+
+        # --- タブ1: 変換モード ---
+        self.tab_convert = ttk.Frame(self.notebook, padding=15)
+        self.notebook.add(self.tab_convert, text='  フォーマット変換 / 画質変更  ')
+        self.setup_convert_tab(self.tab_convert)
+
+        # --- タブ2: 圧縮モード ---
+        self.tab_compress = ttk.Frame(self.notebook, padding=15)
+        self.notebook.add(self.tab_compress, text='  サイズ指定圧縮  ')
+        self.setup_compress_tab(self.tab_compress)
         
-        # --- 実行エリア ---
-        execute_frame = tk.Frame(self)
-        execute_frame.pack(fill=tk.X, padx=10, pady=10)
+        # タブ切り替えイベント
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
+
+
+        # 3. 実行エリア (最下部)
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.progressbar = ttk.Progressbar(action_frame, mode='indeterminate')
+        self.progressbar.pack(fill=tk.X, pady=(0, 10))
+
+        btn_grid = ttk.Frame(action_frame)
+        btn_grid.pack(fill=tk.X)
         
-        self.progressbar = ttk.Progressbar(execute_frame, mode='indeterminate')
-        self.progressbar.pack(fill=tk.X, padx=5, pady=(0, 10))
-
-        btn_frame = tk.Frame(execute_frame)
-        btn_frame.pack(fill=tk.X)
-
         self.execute_button = ttk.Button(
-            btn_frame, text="実行", command=self.execute_task, state="disabled")
-        self.execute_button.pack(side=tk.LEFT, padx=5, pady=5, expand=True, fill=tk.X)
+            btn_grid, text="変換を開始", command=self.execute_task, state="disabled", style="Big.TButton")
+        self.execute_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
 
         self.cancel_button = ttk.Button(
-            btn_frame, text="中止", command=self.cancel_task, state="disabled")
-        self.cancel_button.pack(side=tk.LEFT, padx=5, pady=5, expand=True, fill=tk.X)
+            btn_grid, text="中止", command=self.cancel_task, state="disabled")
+        self.cancel_button.pack(side=tk.LEFT, fill=tk.Y)
 
-        # --- ステータス ---
-        status_label = ttk.Label(
-            self, textvariable=self.status_text, foreground="#333333", anchor="w", relief="sunken")
-        status_label.pack(side=tk.BOTTOM, fill=tk.X, padx=0, pady=0, ipady=3)
+        # ステータスバー
+        status_bar = ttk.Label(self, textvariable=self.status_text, relief="sunken", anchor="w", padding=(5, 2))
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.toggle_mode()
         self.update_encoder_menu()
         self.process_queue()
 
-    def toggle_mode(self):
-        mode = self.mode.get()
-        if mode == "convert":
-            self.compress_frame.pack_forget()
-            self.convert_frame.pack(fill=tk.X)
-        else:
-            self.convert_frame.pack_forget()
-            self.compress_frame.pack(fill=tk.X)
+    def setup_convert_tab(self, parent):
+        """変換タブの中身"""
+        grid_frame = ttk.Frame(parent)
+        grid_frame.pack(fill=tk.X)
+        
+        # グリッド設定
+        grid_frame.columnconfigure(1, weight=1)
 
-        if self.input_file_path.get():
-            self.execute_button["state"] = "normal"
+        # 変換後フォーマット
+        ttk.Label(grid_frame, text="変換後の形式:", font=("Meiryo UI", 10, "bold")).grid(row=0, column=0, sticky="w", pady=10)
+        self.format_menu = ttk.Combobox(grid_frame, textvariable=self.selected_format, state="disabled", width=15, font=("Meiryo UI", 10))
+        self.format_menu.grid(row=0, column=1, sticky="w", padx=10, pady=10)
+        ttk.Label(grid_frame, text="(現在の拡張子も選択可能)").grid(row=0, column=2, sticky="w")
+
+        # 画質設定
+        ttk.Label(grid_frame, text="画質設定:", font=("Meiryo UI", 10, "bold")).grid(row=1, column=0, sticky="w", pady=10)
+        quality_menu = ttk.Combobox(
+            grid_frame, textvariable=self.quality_var, 
+            values=["Original", "High", "Medium", "Low"], state="readonly", width=15, font=("Meiryo UI", 10))
+        quality_menu.grid(row=1, column=1, sticky="w", padx=10, pady=10)
+        ttk.Label(grid_frame, text="※Originalは可能な限り無劣化コピー").grid(row=1, column=2, sticky="w")
+
+        # エンコーダー (動画用)
+        ttk.Label(grid_frame, text="エンコーダー:", font=("Meiryo UI", 10, "bold")).grid(row=2, column=0, sticky="w", pady=10)
+        self.encoder_menu_convert = ttk.Combobox(
+            grid_frame, textvariable=self.selected_encoder, state="readonly", width=30, font=("Meiryo UI", 10))
+        self.encoder_menu_convert.grid(row=2, column=1, columnspan=2, sticky="w", padx=10, pady=10)
+        ttk.Label(grid_frame, text="※動画変換時のみ有効").grid(row=3, column=1, sticky="w", padx=10)
+
+    def setup_compress_tab(self, parent):
+        """圧縮タブの中身"""
+        grid_frame = ttk.Frame(parent)
+        grid_frame.pack(fill=tk.X)
+        
+        grid_frame.columnconfigure(1, weight=1)
+
+        # 目標サイズ
+        ttk.Label(grid_frame, text="目標ファイルサイズ:", font=("Meiryo UI", 10, "bold")).grid(row=0, column=0, sticky="w", pady=10)
+        size_box = ttk.Frame(grid_frame)
+        size_box.grid(row=0, column=1, sticky="w", padx=10, pady=10)
+        
+        ttk.Entry(size_box, textvariable=self.target_size_mb, width=10, font=("Meiryo UI", 10)).pack(side=tk.LEFT)
+        ttk.Label(size_box, text="MB").pack(side=tk.LEFT, padx=5)
+
+        # エンコーダー
+        ttk.Label(grid_frame, text="エンコーダー:", font=("Meiryo UI", 10, "bold")).grid(row=1, column=0, sticky="w", pady=10)
+        self.encoder_menu_compress = ttk.Combobox(
+            grid_frame, textvariable=self.selected_encoder, state="readonly", width=30, font=("Meiryo UI", 10))
+        self.encoder_menu_compress.grid(row=1, column=1, sticky="w", padx=10, pady=10)
+        
+        info_lbl = ttk.Label(grid_frame, text="※2パスエンコードを行い、指定サイズに近づけます。\n※処理に通常の2倍の時間がかかります。", foreground="#555")
+        info_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=20)
+
+    def on_tab_change(self, event):
+        """タブ切り替え時にモード変数を更新"""
+        current_tab = self.notebook.index(self.notebook.select())
+        if current_tab == 0:
+            self.mode.set("convert")
+        else:
+            self.mode.set("compress")
+
+    def update_file_info(self, filepath):
+        """選択されたファイルの情報を表示"""
+        try:
+            size_bytes = os.path.getsize(filepath)
+            size_mb = size_bytes / (1024 * 1024)
+            ext = os.path.splitext(filepath)[1].lower()
+            
+            info = f"サイズ: {size_mb:.2f} MB | 形式: {ext}"
+            
+            # 画像なら解像度も表示
+            if ext.replace('.', '') in self.image_formats:
+                try:
+                    with Image.open(filepath) as img:
+                        info += f" | 解像度: {img.width}x{img.height}"
+                except:
+                    pass
+            
+            self.file_info_text.set(info)
+            self.info_label.config(foreground="#005500") # 緑色にして正常認識を示す
+        except Exception:
+            self.file_info_text.set("ファイル情報の取得に失敗しました")
+            self.info_label.config(foreground="red")
 
     def select_file(self):
         media_exts = []
@@ -297,7 +345,8 @@ class ConverterApp(tk.Tk):
         self.input_file_path.set(filepath)
         self.status_text.set(f"選択中: {os.path.basename(filepath)}")
         self.update_format_options()
-        self.toggle_mode()
+        self.update_file_info(filepath)
+        self.execute_button["state"] = "normal"
 
     def update_format_options(self):
         ext = self.input_file_path.get().split('.')[-1].lower()
@@ -316,9 +365,11 @@ class ConverterApp(tk.Tk):
 
         self.format_menu["values"] = target_formats
         self.format_menu["state"] = "normal"
-        
-        # デフォルトで現在の拡張子を選択状態にする
         self.selected_format.set(ext)
+
+    # --------------------------------------------------------------------------
+    # 処理ロジック (変更なし、以前の修正済みロジックを維持)
+    # --------------------------------------------------------------------------
 
     def execute_task(self):
         if not self.input_file_path.get():
@@ -381,6 +432,8 @@ class ConverterApp(tk.Tk):
         self.cancel_requested = False
         if success:
             self.input_file_path.set("")
+            self.file_info_text.set("ファイル未選択")
+            self.info_label.config(foreground="gray")
             
     def process_queue(self):
         try:
@@ -423,9 +476,8 @@ class ConverterApp(tk.Tk):
         input_path = params["input_path"]
         target_ext = params["target_ext"]
         quality = params["quality"]
-        # メニュー表示名からコーデック名を取得
         selected_encoder_name = params.get("selected_encoder")
-        encoder_codec = "libx264" # デフォルト
+        encoder_codec = "libx264"
         for name, codec in self.available_encoders:
             if name == selected_encoder_name:
                 encoder_codec = codec
@@ -588,9 +640,7 @@ class ConverterApp(tk.Tk):
             raise RuntimeError("動画の長さを取得できませんでした。")
 
     def _has_audio_stream(self, input_path):
-        """動画ファイルに音声ストリームがあるか確認する"""
         if not self.ffprobe_path: return False
-        
         startupinfo = None
         if os.name == 'nt':
             startupinfo = subprocess.STARTUPINFO()
@@ -600,16 +650,12 @@ class ConverterApp(tk.Tk):
             self.ffprobe_path, "-v", "error", "-select_streams", "a",
             "-show_entries", "stream=index", "-of", "csv=p=0", input_path
         ]
-        
         try:
             result = subprocess.run(
                 command, check=False, capture_output=True, text=True, startupinfo=startupinfo
             )
-            # 出力があれば音声ストリームが存在する
             return bool(result.stdout.strip())
         except Exception:
-            # エラーの場合は安全のため音声なしとみなすか、ありとみなすか。
-            # ここでは処理続行のためFalseを返す
             return False
 
     def _process_video(self, input_path, output_path, quality, target_size_mb=None, encoder=None):
@@ -619,7 +665,6 @@ class ConverterApp(tk.Tk):
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-        # 音声ストリームの有無を確認
         has_audio = self._has_audio_stream(input_path)
 
         # --- 目標サイズ指定（2パスエンコード） ---
@@ -630,7 +675,6 @@ class ConverterApp(tk.Tk):
             except Exception as e:
                  raise RuntimeError(f"動画情報の取得失敗: {e}")
 
-            # ビットレート計算
             audio_bitrate_kbps = 128 if has_audio else 0
             target_total_bitrate_kbps = (target_size_mb * 1024 * 8) / duration
             target_video_bitrate_kbps = target_total_bitrate_kbps - audio_bitrate_kbps
@@ -652,7 +696,7 @@ class ConverterApp(tk.Tk):
                     self.ffmpeg_path, "-y", "-i", input_path,
                     "-c:v", encoder, "-b:v", target_video_bitrate_str,
                     "-pass", "1", "-passlogfile", log_prefix,
-                    "-an", # Pass1は必ず音声なし
+                    "-an",
                     "-f", "mp4", null_device
                 ]
                 
@@ -675,7 +719,6 @@ class ConverterApp(tk.Tk):
                     "-pass", "2", "-passlogfile", log_prefix,
                 ]
 
-                # 音声設定の追加
                 if has_audio:
                     pass2_cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate_str])
                 else:
@@ -693,11 +736,9 @@ class ConverterApp(tk.Tk):
                     raise RuntimeError(f"FFmpeg Pass2 エラー:\n{stderr}")
             return
 
-        # --- 通常変換モード (拡張子変換 / 画質設定) ---
+        # --- 通常変換モード ---
         output_ext = output_path.split('.')[-1].lower()
         
-        # Original (ストリームコピー) モード
-        # まずストリームコピーを試みる。失敗したら再エンコードにフォールバック
         need_reencode = True
         
         if quality == "Original":
@@ -714,11 +755,10 @@ class ConverterApp(tk.Tk):
              _, stderr = self.current_process.communicate()
              
              if self.current_process.returncode == 0:
-                 need_reencode = False # 成功したので終了
+                 need_reencode = False
              elif self.cancel_requested:
-                 return # キャンセル時は何もしない
+                 return
              else:
-                 # 失敗した場合
                  self.task_queue.put(("warning", "ストリームコピー不可のため、自動的に再エンコードします。"))
                  quality = "High"
                  encoder = encoder or "libx264"
@@ -729,8 +769,6 @@ class ConverterApp(tk.Tk):
         if not need_reencode:
             return
             
-        # 主要動画形式で再エンコードする場合
-        # ハードウェアエンコード(H.264)が格納可能なコンテナを網羅する
         supported_x264_containers = [
             "mp4", "mkv", "mov", "avi", "flv", "ts", "m2ts", "3gp", "wmv",
             "m4v", "mts", "f4v", "3g2"
@@ -744,32 +782,24 @@ class ConverterApp(tk.Tk):
                 "-c:v", encoder,
             ]
             
-            # エンコーダーごとの画質制御
             if encoder == "libx264":
-                # CRF (Constant Rate Factor)
                 crf_val = "23"
                 if quality == "High": crf_val = "18"
                 elif quality == "Low": crf_val = "28"
                 command.extend(["-crf", crf_val, "-preset", "medium"])
                 
             elif encoder == "h264_nvenc":
-                # Nvidia NVENC
                 cq_val = "23"
                 if quality == "High": cq_val = "19"
                 elif quality == "Low": cq_val = "28"
                 command.extend(["-rc:v", "vbr_hq", "-cq:v", cq_val, "-b:v", "0"])
                 
             elif encoder == "h264_qsv":
-                # Intel QSV
                 q_val = "25"
                 if quality == "High": q_val = "20"
                 elif quality == "Low": q_val = "30"
                 command.extend(["-global_quality", q_val])
             
-            else:
-                pass
-
-            # 音声設定
             if has_audio:
                 command.extend(["-c:a", "aac"])
             else:
@@ -778,8 +808,6 @@ class ConverterApp(tk.Tk):
             command.extend(["-y", output_path])
             
         else:
-            # その他の形式（WebM, GIFなど H.264 コーデックが使えない形式）
-            # 標準変換（CPU）を行う
             if quality != "Original":
                 self.task_queue.put(("status", f"変換中... (形式 {output_ext} は選択されたHWエンコード未対応のため標準変換)"))
 
