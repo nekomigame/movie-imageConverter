@@ -3,12 +3,19 @@ from tkinter import filedialog, messagebox, ttk
 import os
 import sys
 import subprocess
-from PIL import Image
 import threading
 from queue import Queue, Empty
 import shutil
 import tempfile
 import traceback
+import math
+
+# PIL (Pillow) のインポート確認
+try:
+    from PIL import Image, ImageSequence
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
 
 # install_ffmpegがない場合のエラーハンドリング
 try:
@@ -20,7 +27,7 @@ class ConverterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ファイルコンバーター＆圧縮ツール")
-        self.geometry("600x650") # 少し高さを広げた
+        self.geometry("600x650")
         
         # WindowsでのDPIスケーリング対応
         try:
@@ -28,6 +35,12 @@ class ConverterApp(tk.Tk):
             windll.shcore.SetProcessDpiAwareness(1)
         except:
             pass
+        
+        # 起動時の依存ライブラリチェック
+        if not HAS_PILLOW:
+            messagebox.showerror("起動エラー", "必要なライブラリ 'Pillow' が見つかりません。\npip install Pillow を実行してください。")
+            self.destroy()
+            return
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -526,15 +539,54 @@ class ConverterApp(tk.Tk):
         else:
             raise RuntimeError("出力ファイルが生成されませんでした。")
 
+    def _check_if_animated(self, path):
+        """画像がアニメーションを含んでいるかチェック"""
+        try:
+            with Image.open(path) as img:
+                return getattr(img, "is_animated", False)
+        except:
+            return False
+
     def _run_process(self, input_path, output_path, quality=None, target_size_mb=None, encoder=None):
         input_ext = input_path.split('.')[-1].lower().replace('.', '')
+        output_ext = output_path.split('.')[-1].lower().replace('.', '')
         
-        if input_ext in self.image_formats:
-            self._process_image(input_path, output_path, quality, target_size_mb=target_size_mb)
+        is_input_image = input_ext in self.image_formats
+        is_output_image = output_ext in self.image_formats
+        
+        # アニメーション画像の判定 (GIF/WebP/APNG)
+        is_animated_input = False
+        if is_input_image and input_ext in ['gif', 'webp', 'png']:
+            is_animated_input = self._check_if_animated(input_path)
+
+        # 処理ルートの決定
+        # 1. 静止画 -> 静止画 : Pillow (通常ルート)
+        # 2. 動画 -> 動画 : FFmpeg
+        # 3. アニメ画像 -> 動画/画像 : FFmpeg (アニメ情報を維持するため)
+        # 4. 画像 -> 動画 : FFmpeg (Pillowは動画保存不可)
+        # 5. 動画 -> 画像 : FFmpeg (サムネイル切り出し)
+        
+        use_ffmpeg = False
+        if not is_input_image: # 入力が動画なら常にFFmpeg
+            use_ffmpeg = True
+        elif is_animated_input: # アニメ画像ならFFmpeg推奨
+            use_ffmpeg = True
+        elif not is_output_image: # 出力が動画ならFFmpeg必須
+            use_ffmpeg = True
+        
+        # FFmpegがない場合のフォールバック
+        if use_ffmpeg and not self.ffmpeg_path:
+            # 入出力ともに画像なら、アニメーションが失われてもPillowで処理する
+            if is_input_image and is_output_image:
+                self.task_queue.put(("warning", "FFmpegがないため、Pillowで処理します。アニメーション情報は失われます。"))
+                use_ffmpeg = False
+            else:
+                raise RuntimeError("この変換を行うにはFFmpegが必要です。")
+
+        if use_ffmpeg:
+            self._process_video(input_path, output_path, quality, target_size_mb, encoder)
         else:
-            if not self.ffmpeg_path:
-                raise RuntimeError("FFmpegが見つからないため、処理を実行できません。")
-            self._process_video(input_path, output_path, quality, target_size_mb=target_size_mb, encoder=encoder)
+            self._process_image(input_path, output_path, quality, target_size_mb)
 
     def _process_image(self, input_path, output_path, quality, target_size_mb=None):
         with Image.open(input_path) as img:
@@ -625,6 +677,8 @@ class ConverterApp(tk.Tk):
                     hint = "\n【ヒント】入力ファイル(AV1等)がこのFFmpegバージョンでサポートされていないか、破損しています。"
                 elif "Corrupt frame" in stderr:
                     hint = "\n【ヒント】ファイルの一部が破損しています。"
+                elif "height not divisible by 2" in stderr or "width not divisible by 2" in stderr:
+                    hint = "\n【ヒント】動画のサイズが奇数になっています。"
                 
                 # ログを短縮して表示
                 lines = stderr.splitlines()
@@ -678,92 +732,96 @@ class ConverterApp(tk.Tk):
         
         has_audio = self._has_audio_stream(input_path)
         encoder = encoder or "libx264"
+        output_ext = output_path.split('.')[-1].lower()
+        is_output_image = output_ext in self.image_formats
 
         # --- 目標サイズ指定（2パスエンコード） ---
         if target_size_mb is not None:
-            try:
-                duration = self._get_video_duration(input_path)
-            except Exception as e:
-                 raise RuntimeError(f"動画情報の取得失敗: {e}")
+            # 画像出力の場合はサイズ指定圧縮は無効（またはPillowでやるべきだった）
+            if is_output_image:
+                 self.task_queue.put(("warning", "動画から画像への変換では目標サイズ指定は無視されます。"))
+            else:
+                try:
+                    duration = self._get_video_duration(input_path)
+                except Exception as e:
+                    raise RuntimeError(f"動画情報の取得失敗: {e}")
 
-            # ビットレート計算 (kbits/s)
-            # サイズ(MB) * 8192 (kbit/MB) / 秒数
-            target_total_bitrate_kbps = (target_size_mb * 8192) / duration
-            
-            # 音声ビットレートの考慮
-            audio_bitrate_kbps = 128 if has_audio else 0
-            
-            # 全体が小さすぎる場合は音声を削る
-            if target_total_bitrate_kbps < audio_bitrate_kbps + 50: # 映像に最低50kbps残す
-                 audio_bitrate_kbps = 64 # 音質を落とす
-            
-            target_video_bitrate_kbps = target_total_bitrate_kbps - audio_bitrate_kbps
-
-            if target_video_bitrate_kbps < 100:
-                self.task_queue.put(("warning", "目標サイズが極端に小さいため、画質が大幅に低下します。"))
-                target_video_bitrate_kbps = max(30, target_video_bitrate_kbps) # 最低30kbps確保
-
-            target_video_bitrate_str = f"{int(target_video_bitrate_kbps)}k"
-            audio_bitrate_str = f"{audio_bitrate_kbps}k"
-            
-            with tempfile.TemporaryDirectory() as tempdir:
-                # Windowsのパス区切り問題を回避するためにスラッシュ置換
-                log_prefix = os.path.join(tempdir, "ffmpeg2pass").replace('\\', '/')
-                null_device = "NUL" if os.name == 'nt' else "/dev/null"
-
-                self.task_queue.put(("status", f"圧縮中... (1/2 パス, {encoder})"))
+                # ビットレート計算 (kbits/s)
+                # サイズ(MB) * 8192 (kbit/MB) / 秒数
+                target_total_bitrate_kbps = (target_size_mb * 8192) / duration
                 
-                # パス1コマンド（堅牢化フラグ追加）
-                pass1_cmd = [
-                    self.ffmpeg_path, "-y",
-                    "-err_detect", "ignore_err", # 軽微なエラーを無視
-                    "-i", input_path,
-                    "-c:v", encoder, "-b:v", target_video_bitrate_str,
-                    "-pass", "1", "-passlogfile", log_prefix,
-                    "-an",
-                    "-f", "mp4", null_device
-                ]
+                # 音声ビットレートの考慮
+                audio_bitrate_kbps = 128 if has_audio else 0
                 
-                self._run_ffmpeg_command(pass1_cmd, description="Pass 1")
+                # 全体が小さすぎる場合は音声を削る
+                if target_total_bitrate_kbps < audio_bitrate_kbps + 50: # 映像に最低50kbps残す
+                    audio_bitrate_kbps = 64 # 音質を落とす
                 
-                if self.cancel_requested: return
+                target_video_bitrate_kbps = target_total_bitrate_kbps - audio_bitrate_kbps
 
-                self.task_queue.put(("status", f"圧縮中... (2/2 パス, {encoder})"))
+                if target_video_bitrate_kbps < 100:
+                    self.task_queue.put(("warning", "目標サイズが極端に小さいため、画質が大幅に低下します。"))
+                    target_video_bitrate_kbps = max(30, target_video_bitrate_kbps) # 最低30kbps確保
 
-                pass2_cmd = [
-                    self.ffmpeg_path,
-                    "-err_detect", "ignore_err",
-                    "-i", input_path,
-                    "-c:v", encoder, "-b:v", target_video_bitrate_str,
-                    "-pass", "2", "-passlogfile", log_prefix,
-                ]
-
-                if has_audio and audio_bitrate_kbps > 0:
-                    pass2_cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate_str])
-                else:
-                    pass2_cmd.append("-an")
-
-                pass2_cmd.extend(["-y", output_path])
+                target_video_bitrate_str = f"{int(target_video_bitrate_kbps)}k"
+                audio_bitrate_str = f"{audio_bitrate_kbps}k"
                 
-                self._run_ffmpeg_command(pass2_cmd, description="Pass 2")
-            return
+                with tempfile.TemporaryDirectory() as tempdir:
+                    log_prefix = os.path.join(tempdir, "ffmpeg2pass").replace('\\', '/')
+                    null_device = "NUL" if os.name == 'nt' else "/dev/null"
+
+                    self.task_queue.put(("status", f"圧縮中... (1/2 パス, {encoder})"))
+                    
+                    pass1_cmd = [
+                        self.ffmpeg_path, "-y",
+                        "-err_detect", "ignore_err", 
+                        "-i", input_path,
+                        "-c:v", encoder, "-b:v", target_video_bitrate_str,
+                        "-pass", "1", "-passlogfile", log_prefix,
+                        "-an",
+                        "-f", "mp4", null_device
+                    ]
+                    
+                    self._run_ffmpeg_command(pass1_cmd, description="Pass 1")
+                    
+                    if self.cancel_requested: return
+
+                    self.task_queue.put(("status", f"圧縮中... (2/2 パス, {encoder})"))
+
+                    pass2_cmd = [
+                        self.ffmpeg_path,
+                        "-err_detect", "ignore_err",
+                        "-i", input_path,
+                        "-c:v", encoder, "-b:v", target_video_bitrate_str,
+                        "-pass", "2", "-passlogfile", log_prefix,
+                    ]
+
+                    if has_audio and audio_bitrate_kbps > 0:
+                        pass2_cmd.extend(["-c:a", "aac", "-b:a", audio_bitrate_str])
+                    else:
+                        pass2_cmd.append("-an")
+
+                    pass2_cmd.extend(["-y", output_path])
+                    
+                    self._run_ffmpeg_command(pass2_cmd, description="Pass 2")
+                return
 
         # --- 通常変換モード ---
-        output_ext = output_path.split('.')[-1].lower()
         need_reencode = True
-        
-        if quality == "Original":
-             command = [
-                self.ffmpeg_path, 
-                "-err_detect", "ignore_err",
-                "-i", input_path,
-                "-c", "copy",
-                "-y", output_path
-            ]
-             
+        command = [self.ffmpeg_path, "-err_detect", "ignore_err", "-i", input_path]
+
+        # 動画 -> 画像の場合の特別処理
+        if is_output_image:
+            # 先頭フレームのみ出力
+            command.extend(["-vframes", "1"])
+            need_reencode = True # 必ずエンコード(変換)が必要
+            
+        elif quality == "Original":
              try:
-                self._run_ffmpeg_command(command, description="Stream Copy")
-                need_reencode = False
+                # ストリームコピーを試みる
+                copy_cmd = command + ["-c", "copy", "-y", output_path]
+                self._run_ffmpeg_command(copy_cmd, description="Stream Copy")
+                return
              except RuntimeError:
                  if self.cancel_requested: return
                  self.task_queue.put(("warning", "ストリームコピーに失敗しました。自動的に再エンコードします。"))
@@ -778,14 +836,12 @@ class ConverterApp(tk.Tk):
             "m4v", "mts", "f4v", "3g2"
         ]
 
-        # 選択したエンコーダーが使えるコンテナかどうか判定
+        # 偶数サイズへのパディングフィルタ（画像->動画変換などで必要）
+        # 幅/2の余りがある場合、または高さ/2の余りがある場合にパディング
+        vf_filter = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+
         if output_ext in supported_x264_containers:
-            command = [
-                self.ffmpeg_path,
-                "-err_detect", "ignore_err", 
-                "-i", input_path,
-                "-c:v", encoder,
-            ]
+            command.extend(["-c:v", encoder])
             
             if encoder == "libx264":
                 crf_val = "23"
@@ -805,23 +861,27 @@ class ConverterApp(tk.Tk):
                 elif quality == "Low": q_val = "30"
                 command.extend(["-global_quality", q_val])
             
+            # フィルタ適用
+            command.extend(["-vf", vf_filter])
+
             if has_audio:
                 command.extend(["-c:a", "aac"])
             else:
-                command.append("-an")
+                pass 
+                # 元々音声がない、または画像からの変換などの場合は何もしない
 
             command.extend(["-y", output_path])
             
         else:
-            if quality != "Original":
+            if quality != "Original" and not is_output_image:
                 self.task_queue.put(("status", f"変換中... (形式 {output_ext} はHWエンコード未対応のため標準変換)"))
 
-            command = [
-                self.ffmpeg_path, 
-                "-err_detect", "ignore_err",
-                "-i", input_path,
-                "-y", output_path
-            ]
+            # 汎用変換（画像出力もここを通る）
+            # 動画出力の場合はパディングフィルタを一応つけておく
+            if not is_output_image:
+                command.extend(["-vf", vf_filter])
+                
+            command.extend(["-y", output_path])
         
         self._run_ffmpeg_command(command, description="Encoding")
 

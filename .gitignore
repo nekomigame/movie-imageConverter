@@ -4,7 +4,11 @@ venv/
 build/
 dist/
 __pycache__/
+main.dist/
+main.build/
+main.onefile-build/
 
+main.exe
 ffmpeg.exe
 ffprobe.exe
 説明書.pdf
